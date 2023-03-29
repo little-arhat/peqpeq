@@ -1,62 +1,93 @@
 use std::env;
+use std::collections::VecDeque;
 
 use parquet2::{
+    FallibleStreamingIterator,
     page::CompressedPage,
     read::{get_page_iterator, read_metadata},
-    error::Result,
+    write::{
+        DynIter,
+        DynStreamingIterator, FileWriter, Version,
+        WriteOptions,
+    },
+    error::{Error, Result},
 };
+
+
+struct PageBuffer {
+    columns: VecDeque<CompressedPage>,
+    current: Option<CompressedPage>,
+}
+
+impl PageBuffer {
+    pub fn new(columns: VecDeque<CompressedPage>) -> Self {
+        Self {
+            columns,
+            current: None,
+        }
+    }
+}
+
+impl FallibleStreamingIterator for PageBuffer {
+    type Item = CompressedPage;
+    type Error = Error;
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = self.columns.pop_front();
+        Ok(())
+    }
+
+    fn get(&self) -> Option<&Self::Item> {
+        self.current.as_ref()
+    }
+}
 
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let path = &args[1];
 
-    let mut file = std::fs::File::open(path)?;
-    let metadata = read_metadata(&mut file)?;
+    let mut in_file = std::fs::File::open(&args[1])?;
+    let metadata = read_metadata(&mut in_file)?;
     let num_cols = metadata.schema().fields().len();
 
-    for (i, group) in metadata.row_groups.iter().enumerate() {
-        println!(
-            "Group: {:<10}Rows: {:<15}Bytes: {:}",
-            i,
-            group.num_rows(),
-            group.total_byte_size()
-        );
-        println!("\\m/");
+    let out_file = std::io::BufWriter::new(std::fs::File::create(&args[2])?);
+    let options = WriteOptions {
+        write_statistics: false,
+        version: Version::V2,
+    };
+    let schema_to_write = metadata.schema().clone();
+    let mut writer = FileWriter::new(out_file, schema_to_write, options, None);
 
-        for column in 0..num_cols {
-            let column_meta = &group.columns()[column];
-            println!("{:?}", column_meta);
-            let iter = get_page_iterator(column_meta,
-                                         &mut file,
-                                         None,
-                                         vec![],
-                                         1024 * 1024)?;
-            for (page_ind, compressed_page) in iter.enumerate() {
-                let compressed_page = compressed_page?;
-                print!(
-                    "\nPage: {:<10}Column: {:<15}; ",
-                    page_ind,
-                    column
-                );
-                match compressed_page {
-                    CompressedPage::Dict(dict_page) => {
-                        println!("dict page; sorted: {}", dict_page.is_sorted);
-                        // the first page may be a dictionary page, which needs to be deserialized
-                        // depending on your target in-memory format, you may want to deserialize
-                        // the values differently...
-                        // let page = deserialize_dict(&page)?;
-                        // dict = Some(page);
-                    }
-                    CompressedPage::Data(_data_page) => {
-                        println!("data page");
-                        //let _array = deserialize(&page, dict.as_ref())?;
-                    }
-                }
+    writer.write(DynIter::new(
+        metadata.row_groups
+            .iter()
+            .map(|group| {
+                println!("reading group: {:?}", group);
+                let pgs =
+                    (0..num_cols)
+                        .into_iter()
+                        .map(|i| &group.columns()[i])
+                        .map(|column_meta| {
+                            println!("reading {:?}", column_meta);
+                            get_page_iterator(column_meta,
+                                               &mut in_file,
+                                               None,
+                                               vec![],
+                                               1024 * 1024)
+                                .into_iter()
+                                .flatten()
+                                .collect::<VecDeque<_>>()
+                                .into_iter()
+                        })
+                        .flatten()
+                        .flatten()
+                        .collect::<VecDeque<_>>();
+                 println!("Read {} pages", pgs.len());
+                 let pb = PageBuffer::new(pgs);
+                 Ok(DynStreamingIterator::new(pb))
+            })))?;
 
-            }
-        }
-    }
+    writer.end(metadata.key_value_metadata)?;
 
     Ok(())
 }
