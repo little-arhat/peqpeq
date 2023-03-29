@@ -58,34 +58,25 @@ fn main() -> Result<()> {
     let schema_to_write = metadata.schema().clone();
     let mut writer = FileWriter::new(out_file, schema_to_write, options, None);
 
-    writer.write(DynIter::new(
-        metadata.row_groups
-            .iter()
-            .map(|group| {
-                println!("reading group: {:?}", group);
-                let pgs =
-                    (0..num_cols)
+    for group in metadata.row_groups.iter() {
+        let col_iters =
+            (0..num_cols)
+            .into_iter()
+            .map(|i| &group.columns()[i])
+            .map(|column_meta|
+                 Ok(DynStreamingIterator::new(PageBuffer::new(
+                    get_page_iterator(column_meta,
+                                      &mut in_file,
+                                      None,
+                                      vec![],
+                                      1024 * 1024)
                         .into_iter()
-                        .map(|i| &group.columns()[i])
-                        .map(|column_meta| {
-                            println!("reading {:?}", column_meta);
-                            get_page_iterator(column_meta,
-                                               &mut in_file,
-                                               None,
-                                               vec![],
-                                               1024 * 1024)
-                                .into_iter()
-                                .flatten()
-                                .collect::<VecDeque<_>>()
-                                .into_iter()
-                        })
                         .flatten()
                         .flatten()
-                        .collect::<VecDeque<_>>();
-                 println!("Read {} pages", pgs.len());
-                 let pb = PageBuffer::new(pgs);
-                 Ok(DynStreamingIterator::new(pb))
-            })))?;
+                        .collect::<VecDeque<_>>())))
+            );
+        writer.write(DynIter::new(col_iters))?;
+    }
 
     writer.end(metadata.key_value_metadata)?;
 
